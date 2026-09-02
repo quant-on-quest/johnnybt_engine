@@ -1,0 +1,26 @@
+[package]
+name = "johnnybt_engine"
+version = "0.1.0"
+edition = "2021"
+
+# The account walk as a library: no Python in it. A policy crate links it
+# for the bookkeeping trait; a polars plugin crate links it with the
+# `polars` feature for the frame-in, frame-out marshalling.
+
+[lib]
+name = "johnnybt_engine"
+crate-type = ["rlib"]
+
+[features]
+default = []
+polars = ["dep:polars", "dep:serde"]
+
+[dependencies]
+ndarray = "0.17"
+rayon = "1.10"
+polars = { version = "0.55.1", features = ["dtype-struct"], default-features = false, optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+
+[profile.release]
+lto = true
+codegen-units = 1
