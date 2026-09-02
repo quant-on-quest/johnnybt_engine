@@ -8,7 +8,7 @@
 //! polars runs the groups on its own thread pool; the walk never sees a
 //! thread.
 
-use ndarray::{Array1, Array2, Array3, Array4};
+use ndarray::{Array1, Array2, Array3, Array4, ArrayView2};
 use polars::prelude::*;
 use serde::Deserialize;
 
@@ -79,20 +79,34 @@ fn width_of(column: &Series) -> PolarsResult<usize> {
     Ok(0)
 }
 
-/// Read a `(T, N)` float list column into one contiguous matrix.
-///
-/// A column with no null rows is one memcpy of its flattened values; a
-/// column with nulls (a firing's targets) is read row by row.
-fn floats(column: &Series, steps: usize, width: usize) -> PolarsResult<Array2<f64>> {
+/// A `(T, N)` float plane: the frame's own flattened values when the
+/// column has no null row (no copy), or a matrix read row by row.
+enum Plane {
+    Flat(Float64Chunked),
+    Owned(Array2<f64>),
+}
+
+impl Plane {
+    fn view(&self, steps: usize, width: usize) -> PolarsResult<ArrayView2<'_, f64>> {
+        match self {
+            Plane::Flat(values) => {
+                let slice = values.cont_slice().map_err(|e| polars_err!(ComputeError: "not contiguous: {e}"))?;
+                ArrayView2::from_shape((steps, width), slice)
+                    .map_err(|e| polars_err!(ComputeError: "list column does not reshape: {e}"))
+            }
+            Plane::Owned(matrix) => Ok(matrix.view()),
+        }
+    }
+}
+
+/// Read a `(T, N)` float list column.
+fn floats(column: &Series, steps: usize, width: usize) -> PolarsResult<Plane> {
     let list = column.list()?;
     if list.null_count() == 0 {
         let flat = list.explode(ExplodeOptions { empty_as_null: false, keep_nulls: false })?;
-        let values = flat.f64()?.rechunk();
-        if let Ok(slice) = values.cont_slice() {
-            if slice.len() == steps * width {
-                return Array2::from_shape_vec((steps, width), slice.to_vec())
-                    .map_err(|e| polars_err!(ComputeError: "list column does not reshape: {e}"));
-            }
+        let values = flat.f64()?.rechunk().into_owned();
+        if values.null_count() == 0 && values.len() == steps * width && values.cont_slice().is_ok() {
+            return Ok(Plane::Flat(values));
         }
     }
     let mut out = Array2::<f64>::from_elem((steps, width), f64::NAN);
@@ -104,22 +118,24 @@ fn floats(column: &Series, steps: usize, width: usize) -> PolarsResult<Array2<f6
             }
         }
     }
-    Ok(out)
+    Ok(Plane::Owned(out))
 }
 
-/// Read a `(T, N)` boolean list column into one contiguous matrix.
+/// Read a `(T, N)` boolean list column into one matrix, bits unpacked in one pass.
 fn booleans(column: &Series, steps: usize, width: usize) -> PolarsResult<Array2<bool>> {
     let list = column.list()?;
+    let mut out = Array2::<bool>::from_elem((steps, width), false);
     if list.null_count() == 0 {
         let flat = list.explode(ExplodeOptions { empty_as_null: false, keep_nulls: false })?;
         let values = flat.bool()?.rechunk();
         if values.len() == steps * width && values.null_count() == 0 {
-            let collected: Vec<bool> = values.downcast_iter().flat_map(|arr| arr.values_iter()).collect();
-            return Array2::from_shape_vec((steps, width), collected)
-                .map_err(|e| polars_err!(ComputeError: "list column does not reshape: {e}"));
+            let cells = out.as_slice_mut().expect("fresh matrix is contiguous");
+            for (cell, bit) in cells.iter_mut().zip(values.downcast_iter().flat_map(|arr| arr.values_iter())) {
+                *cell = bit;
+            }
+            return Ok(out);
         }
     }
-    let mut out = Array2::<bool>::from_elem((steps, width), false);
     for (t, row) in list.amortized_iter().enumerate() {
         if let Some(inner) = row {
             let values = inner.as_ref().bool()?;
@@ -131,32 +147,19 @@ fn booleans(column: &Series, steps: usize, width: usize) -> PolarsResult<Array2<
     Ok(out)
 }
 
-/// Stack `P` `(T, N)` matrices into `(P, T, N)`.
-fn stacked_floats(inputs: &[Series], which: &[usize], steps: usize, width: usize) -> PolarsResult<Array3<f64>> {
-    let mut out = Array3::<f64>::from_elem((which.len(), steps, width), f64::NAN);
-    for (p, &index) in which.iter().enumerate() {
-        let plane = floats(&inputs[index], steps, width)?;
-        out.index_axis_mut(ndarray::Axis(0), p).assign(&plane);
-    }
-    Ok(out)
-}
-
-fn stacked_booleans(
+/// One boolean plane per point, or `default` everywhere when the kwargs name none.
+fn boolean_planes(
     inputs: &[Series],
     which: Option<&Vec<usize>>,
     points: usize,
     steps: usize,
     width: usize,
     default: bool,
-) -> PolarsResult<Array3<bool>> {
-    let mut out = Array3::<bool>::from_elem((points, steps, width), default);
-    if let Some(which) = which {
-        for (p, &index) in which.iter().enumerate() {
-            let plane = booleans(&inputs[index], steps, width)?;
-            out.index_axis_mut(ndarray::Axis(0), p).assign(&plane);
-        }
+) -> PolarsResult<Vec<Array2<bool>>> {
+    match which {
+        Some(which) => which.iter().map(|&index| booleans(&inputs[index], steps, width)).collect(),
+        None => Ok((0..points).map(|_| Array2::<bool>::from_elem((steps, width), default)).collect()),
     }
-    Ok(out)
 }
 
 /// Walk one account under policy `B` and answer one struct per bar.
@@ -173,12 +176,12 @@ pub fn simulate<B: Bookkeeping>(inputs: &[Series], kwargs: &SimulateKwargs) -> P
     let has_previous = kwargs.previous.is_some();
     let previous = match kwargs.previous {
         Some(index) => floats(&inputs[index], steps, width)?,
-        None => Array2::<f64>::zeros((steps, width)),
+        None => Plane::Owned(Array2::<f64>::zeros((steps, width))),
     };
-    let prices = stacked_floats(inputs, &kwargs.prices, steps, width)?;
-    let buyable = stacked_booleans(inputs, kwargs.buyable.as_ref(), points, steps, width, true)?;
-    let sellable = stacked_booleans(inputs, kwargs.sellable.as_ref(), points, steps, width, true)?;
-    let impound = stacked_booleans(inputs, kwargs.impound.as_ref(), points, steps, width, false)?;
+    let prices: Vec<Plane> = kwargs.prices.iter().map(|&index| floats(&inputs[index], steps, width)).collect::<PolarsResult<_>>()?;
+    let buyable = boolean_planes(inputs, kwargs.buyable.as_ref(), points, steps, width, true)?;
+    let sellable = boolean_planes(inputs, kwargs.sellable.as_ref(), points, steps, width, true)?;
+    let impound = boolean_planes(inputs, kwargs.impound.as_ref(), points, steps, width, false)?;
 
     // Decisions: every firing's non-null rows become plan rows, numbered in
     // bar order per tranche; the firing table points each (bar, point) at
@@ -231,8 +234,16 @@ pub fn simulate<B: Bookkeeping>(inputs: &[Series], kwargs: &SimulateKwargs) -> P
             let d = row_of[f][j];
             j += 1;
             let values = inner.as_ref().f64()?;
-            for (i, v) in values.iter().enumerate() {
-                plan[(0, firing.tranche, d, i)] = v.unwrap_or(0.0);
+            let mut target = plan.slice_mut(ndarray::s![0, firing.tranche, d, ..]);
+            match values.cont_slice() {
+                Ok(slice) if slice.len() == width => {
+                    target.as_slice_mut().expect("plan row is contiguous").copy_from_slice(slice);
+                }
+                _ => {
+                    for (i, v) in values.iter().enumerate() {
+                        target[i] = v.unwrap_or(0.0);
+                    }
+                }
             }
             at[(0, firing.tranche, t, firing.point)] = d as i32;
             if let Some(flags) = &flags {
@@ -279,14 +290,14 @@ pub fn simulate<B: Bookkeeping>(inputs: &[Series], kwargs: &SimulateKwargs) -> P
         plan: plan.view(),
         at: at.view(),
         standing: standing.view(),
-        prices: prices.view(),
-        mark: mark.view(),
-        impound: impound.view(),
-        previous: previous.view(),
+        prices: prices.iter().map(|plane| plane.view(steps, width)).collect::<PolarsResult<_>>()?,
+        mark: mark.view(steps, width)?,
+        impound: impound.iter().map(|plane| plane.view()).collect(),
+        previous: previous.view(steps, width)?,
         has_previous,
         new_day: new_day.view(),
-        buyable: buyable.view(),
-        sellable: sellable.view(),
+        buyable: buyable.iter().map(|plane| plane.view()).collect(),
+        sellable: sellable.iter().map(|plane| plane.view()).collect(),
         instrument: instrument.view(),
         epoch: epoch.view(),
         rates: rates.view(),

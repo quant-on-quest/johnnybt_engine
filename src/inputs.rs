@@ -35,14 +35,17 @@ pub struct Inputs<'a> {
     pub plan: ArrayView4<'a, f64>,
     pub at: ArrayView4<'a, i32>,
     pub standing: ArrayView4<'a, bool>,
-    pub prices: ArrayView3<'a, f64>,
+    /// One `(T, N)` plane per price point — each a view over the caller's
+    /// own buffer, so a plane the frame already holds contiguously is never
+    /// copied to be stacked.
+    pub prices: Vec<ArrayView2<'a, f64>>,
     pub mark: ArrayView2<'a, f64>,
-    pub impound: ArrayView3<'a, bool>,
+    pub impound: Vec<ArrayView2<'a, bool>>,
     pub previous: ArrayView2<'a, f64>,
     pub has_previous: bool,
     pub new_day: ArrayView1<'a, bool>,
-    pub buyable: ArrayView3<'a, bool>,
-    pub sellable: ArrayView3<'a, bool>,
+    pub buyable: Vec<ArrayView2<'a, bool>>,
+    pub sellable: Vec<ArrayView2<'a, bool>>,
     pub instrument: ArrayView1<'a, i32>,
     pub epoch: ArrayView1<'a, i32>,
     pub rates: ArrayView3<'a, f64>,
@@ -54,6 +57,42 @@ pub struct Inputs<'a> {
 }
 
 impl<'a> Inputs<'a> {
+    /// How many price points a bar carries.
+    #[inline]
+    pub fn points(&self) -> usize {
+        self.prices.len()
+    }
+
+    /// How many bars.
+    #[inline]
+    pub fn steps(&self) -> usize {
+        self.mark.shape()[0]
+    }
+
+    /// The price at one point of one bar for one instrument.
+    #[inline]
+    pub fn price(&self, phase: usize, t: usize, i: usize) -> f64 {
+        self.prices[phase][(t, i)]
+    }
+
+    /// Whether a buy can fill there.
+    #[inline]
+    pub fn buyable(&self, phase: usize, t: usize, i: usize) -> bool {
+        self.buyable[phase][(t, i)]
+    }
+
+    /// Whether a sell can fill there.
+    #[inline]
+    pub fn sellable(&self, phase: usize, t: usize, i: usize) -> bool {
+        self.sellable[phase][(t, i)]
+    }
+
+    /// Whether a holding is stuck at the limit there.
+    #[inline]
+    pub fn impound(&self, phase: usize, t: usize, i: usize) -> bool {
+        self.impound[phase][(t, i)]
+    }
+
     /// The instrument's class code.
     #[inline]
     pub fn class(&self, i: usize) -> usize {

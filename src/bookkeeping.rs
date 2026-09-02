@@ -116,13 +116,13 @@ impl Plain {
         let (t, phase, e) = (at.t, at.phase, at.e);
         for idx in 0..acct.named(k).len() {
             let i = acct.named(k)[idx];
-            let p = inp.prices[(phase, t, i)];
+            let p = inp.price(phase, t, i);
             if p.is_nan() || p <= 0.0 {
                 continue;
             }
             let cell = acct.at(k, i);
             let mut give = acct.qty[cell] - acct.target[cell];
-            if give <= 0.0 || !inp.sellable[(phase, t, i)] {
+            if give <= 0.0 || !inp.sellable(phase, t, i) {
                 continue;
             }
             if acct.blocked[cell] && give > self.budget[cell] {
@@ -151,7 +151,7 @@ impl Plain {
     /// Returns `(units, turnover, fee)`, units zero when nothing fits.
     fn affordable(&self, acct: &Account, inp: &Inputs, k: usize, i: usize, at: Point) -> (f64, f64, f64) {
         let (t, phase, e) = (at.t, at.phase, at.e);
-        let p = inp.prices[(phase, t, i)];
+        let p = inp.price(phase, t, i);
         let cell = acct.at(k, i);
         let mut take = acct.target[cell] - acct.qty[cell];
         if take <= 0.0 || p.is_nan() || p <= 0.0 {
@@ -194,7 +194,7 @@ impl Plain {
         }
         let cell = acct.at(k, i);
         acct.touch(k, i);
-        if !inp.buyable[(at.phase, at.t, i)] {
+        if !inp.buyable(at.phase, at.t, i) {
             let cost = turnover + fee;
             self.locked[cell] = cost;
             self.locked_total += cost;
@@ -249,7 +249,7 @@ impl Bookkeeping for Plain {
             for idx in 0..acct.named(k).len() {
                 let i = acct.named(k)[idx];
                 let cell = self.at(k, i);
-                if self.locked[cell] <= 0.0 || !inp.buyable[(at.phase, at.t, i)] {
+                if self.locked[cell] <= 0.0 || !inp.buyable(at.phase, at.t, i) {
                     continue;
                 }
                 self.release(cell);

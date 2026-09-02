@@ -183,7 +183,7 @@ impl Account {
     /// A price point quotes: every name with a price is worth that now.
     pub fn mark_point(&mut self, inp: &Inputs, at: Point) {
         for i in 0..self.n {
-            let p = inp.prices[(at.phase, at.t, i)];
+            let p = inp.price(at.phase, at.t, i);
             if !p.is_nan() && p > 0.0 {
                 self.last[i] = p;
             }
@@ -211,7 +211,7 @@ impl Account {
                 for idx in 0..self.active[k].len() {
                     let i = self.active[k][idx];
                     let cell = self.at(k, i);
-                    if inp.impound[(phase, t, i)] && self.qty[cell] > 0.0 {
+                    if inp.impound(phase, t, i) && self.qty[cell] > 0.0 {
                         self.liq[i] += self.qty[cell];
                         self.qty[cell] = 0.0;
                         insert_sorted(&mut self.pool, i);
@@ -251,8 +251,8 @@ impl Account {
             if self.liq[i] <= 0.0 {
                 continue;
             }
-            let p = inp.prices[(phase, t, i)];
-            if p.is_nan() || p <= 0.0 || !inp.sellable[(phase, t, i)] {
+            let p = inp.price(phase, t, i);
+            if p.is_nan() || p <= 0.0 || !inp.sellable(phase, t, i) {
                 continue;
             }
             let c = inp.class(i);
@@ -333,7 +333,7 @@ impl Account {
         let mut want = decide(
             investable,
             weight,
-            inp.prices[(phase, t, i)],
+            inp.price(phase, t, i),
             inp.rate(LOT, e, c),
             inp.rate(MIN_LOT, e, c),
             inp.rate(MIN_NOTIONAL, e, c),

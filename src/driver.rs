@@ -11,8 +11,8 @@ use crate::inputs::*;
 pub fn run_account<B: Bookkeeping>(r: usize, inp: &Inputs, reported: &mut [f64], positions: &mut [f64]) {
     let tranches = inp.plan.shape()[1];
     let n = inp.plan.shape()[3];
-    let phases = inp.prices.shape()[0];
-    let steps = inp.prices.shape()[1];
+    let phases = inp.points();
+    let steps = inp.steps();
 
     let mut acct = Account::new(r, tranches, n, inp.capital);
     let mut book = B::new(tranches, n);
@@ -57,7 +57,7 @@ pub fn run_account<B: Bookkeeping>(r: usize, inp: &Inputs, reported: &mut [f64],
 /// `(1, 1, 1)` placeholder when positions are not recorded).
 pub fn run_all<B: Bookkeeping>(inputs: &Inputs) -> (Array3<f64>, Array3<f64>) {
     let runs = inputs.plan.shape()[0];
-    let steps = inputs.prices.shape()[1];
+    let steps = inputs.steps();
     let n = inputs.plan.shape()[3];
     let record_positions = inputs.record_positions;
 
