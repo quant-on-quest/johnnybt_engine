@@ -36,6 +36,15 @@ pub struct Account {
     pub fire: Vec<i64>,
     /// `(K, N)` which reductions the settlement refused when sized.
     pub blocked: Vec<bool>,
+    /// `(K,)` the names each tranche's book is doing anything with, ascending:
+    /// a unit held, a target struck, a refusal recorded, or state the policy
+    /// keeps. A market has thousands of names and a book touches a dozen;
+    /// every per-point phase walks these and nothing else, in the same
+    /// ascending order the dense scan took — so every sum adds the same
+    /// non-zero terms in the same order, and the answer is the same bit.
+    pub active: Vec<Vec<usize>>,
+    /// The names the liquidation pool holds, ascending.
+    pub pool: Vec<usize>,
     /// The bar's fees, purchase turnover and sale turnover so far.
     pub fees: f64,
     pub bought: f64,
@@ -59,6 +68,8 @@ impl Account {
             attained_row: vec![-1; tranches],
             fire: vec![-1; tranches],
             blocked: vec![false; tranches * n],
+            active: vec![Vec::new(); tranches],
+            pool: Vec::new(),
             fees: 0.0,
             bought: 0.0,
             sold: 0.0,
@@ -70,6 +81,47 @@ impl Account {
     #[inline]
     pub fn at(&self, k: usize, i: usize) -> usize {
         k * self.n + i
+    }
+
+    /// Note that tranche `k` is doing something with name `i`.
+    #[inline]
+    pub fn touch(&mut self, k: usize, i: usize) {
+        insert_sorted(&mut self.active[k], i);
+    }
+
+    /// The names tranche `k` is doing something with, ascending.
+    #[inline]
+    pub fn named(&self, k: usize) -> &[usize] {
+        &self.active[k]
+    }
+
+    /// The names a decision row weights, ascending — a missing weight
+    /// (NaN, "keep the book") names the instrument too.
+    pub fn row_names(&self, inp: &Inputs, k: usize, d: usize) -> Vec<usize> {
+        let r = self.r;
+        (0..self.n).filter(|&i| inp.plan[(r, k, d, i)] != 0.0).collect()
+    }
+
+    /// Every name any book or the pool holds, ascending.
+    pub fn union_names(&self) -> Vec<usize> {
+        let mut out = self.pool.clone();
+        for k in 0..self.tranches {
+            out = merged(&out, &self.active[k]);
+        }
+        out
+    }
+
+    /// Forget the names whose cells are back at rest: nothing held, no
+    /// target, no refusal, and nothing the policy keeps for them.
+    pub fn sweep(&mut self, at_rest: impl Fn(usize, usize) -> bool) {
+        for k in 0..self.tranches {
+            let n = self.n;
+            let (qty, target, blocked) = (&self.qty, &self.target, &self.blocked);
+            self.active[k].retain(|&i| {
+                let cell = k * n + i;
+                !(qty[cell] == 0.0 && target[cell] == 0.0 && !blocked[cell] && at_rest(k, i))
+            });
+        }
     }
 
     /// The value of one name's `units` at its last quote.
@@ -112,6 +164,7 @@ impl Account {
     }
 
     /// Everything the account holds in one name, tranches and pool alike.
+    #[inline]
     pub fn held(&self, i: usize) -> f64 {
         let mut total = self.liq[i];
         for k in 0..self.tranches {
@@ -155,11 +208,13 @@ impl Account {
         for k in 0..self.tranches {
             let mut d = inp.at[(r, k, t, phase)];
             if d >= 0 {
-                for i in 0..self.n {
+                for idx in 0..self.active[k].len() {
+                    let i = self.active[k][idx];
                     let cell = self.at(k, i);
                     if inp.impound[(phase, t, i)] && self.qty[cell] > 0.0 {
                         self.liq[i] += self.qty[cell];
                         self.qty[cell] = 0.0;
+                        insert_sorted(&mut self.pool, i);
                     }
                 }
             }
@@ -190,7 +245,9 @@ impl Account {
     /// The liquidation pool tries to leave at every point.
     pub fn pool_sell(&mut self, inp: &Inputs, at: Point) {
         let (t, phase, e) = (at.t, at.phase, at.e);
-        for i in 0..self.n {
+        let mut emptied = false;
+        for idx in 0..self.pool.len() {
+            let i = self.pool[idx];
             if self.liq[i] <= 0.0 {
                 continue;
             }
@@ -206,6 +263,11 @@ impl Account {
             self.cash += turnover - fee;
             self.fees += fee;
             self.sold += turnover;
+            emptied = true;
+        }
+        if emptied {
+            let liq = &self.liq;
+            self.pool.retain(|&i| liq[i] > 0.0);
         }
     }
 
@@ -213,13 +275,13 @@ impl Account {
     /// sold into it, so its proceeds are cash and its fees already paid.
     pub fn snapshot_equity(&mut self, inp: &Inputs, at: Point) {
         let mut equity = self.cash;
-        for i in 0..self.n {
+        for &i in self.pool.iter() {
             if self.liq[i] != 0.0 {
                 equity += self.worth(inp, at, i, self.liq[i]);
             }
         }
         for k in 0..self.tranches {
-            for i in 0..self.n {
+            for &i in self.active[k].iter() {
                 let units = self.qty[self.at(k, i)];
                 if units != 0.0 {
                     equity += self.worth(inp, at, i, units);
@@ -232,7 +294,7 @@ impl Account {
     /// The market value of one tranche's book.
     pub fn holding(&self, inp: &Inputs, k: usize, at: Point) -> f64 {
         let mut holding = 0.0f64;
-        for i in 0..self.n {
+        for &i in self.active[k].iter() {
             let units = self.qty[self.at(k, i)];
             if units != 0.0 {
                 holding += self.worth(inp, at, i, units);
@@ -309,13 +371,20 @@ impl Account {
             }
         }
         let mut value = 0.0f64;
-        for i in 0..self.n {
-            let total = self.held(i);
-            if total != 0.0 {
-                value += self.worth(inp, at, i, total);
-            }
-            if inp.record_positions {
+        if inp.record_positions {
+            for i in 0..self.n {
+                let total = self.held(i);
+                if total != 0.0 {
+                    value += self.worth(inp, at, i, total);
+                }
                 positions[t * self.n + i] = total;
+            }
+        } else {
+            for i in self.union_names() {
+                let total = self.held(i);
+                if total != 0.0 {
+                    value += self.worth(inp, at, i, total);
+                }
             }
         }
         reported[EQUITY * steps + t] = self.cash + value;
@@ -324,4 +393,34 @@ impl Account {
         reported[BOUGHT * steps + t] = self.bought;
         reported[SOLD * steps + t] = self.sold;
     }
+}
+
+/// Insert `i` into an ascending list, if it is not there.
+#[inline]
+pub fn insert_sorted(names: &mut Vec<usize>, i: usize) {
+    if let Err(at) = names.binary_search(&i) {
+        names.insert(at, i);
+    }
+}
+
+/// The union of two ascending lists, ascending.
+pub fn merged(a: &[usize], b: &[usize]) -> Vec<usize> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut x, mut y) = (0, 0);
+    while x < a.len() && y < b.len() {
+        if a[x] < b[y] {
+            out.push(a[x]);
+            x += 1;
+        } else if b[y] < a[x] {
+            out.push(b[y]);
+            y += 1;
+        } else {
+            out.push(a[x]);
+            x += 1;
+            y += 1;
+        }
+    }
+    out.extend_from_slice(&a[x..]);
+    out.extend_from_slice(&b[y..]);
+    out
 }

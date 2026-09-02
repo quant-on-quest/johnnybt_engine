@@ -47,6 +47,7 @@ pub fn run_account<B: Bookkeeping>(r: usize, inp: &Inputs, reported: &mut [f64],
 
         book.close_bar(&mut acct);
         acct.close_bar(inp, Point { t, phase: phases - 1, e }, reported, positions, steps);
+        acct.sweep(|k, i| book.at_rest(k, i));
     }
 }
 
