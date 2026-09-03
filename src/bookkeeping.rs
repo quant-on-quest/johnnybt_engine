@@ -13,11 +13,11 @@ use crate::inputs::*;
 /// One bookkeeping policy, walked alongside the account.
 pub trait Bookkeeping {
     /// Fresh state for one run.
-    fn new(tranches: usize, n: usize) -> Self;
+    fn new(tranches: usize, assets: usize) -> Self;
 
     /// A corporate action scaled every book's units of name `i` by `ratio`;
     /// scale whatever per-name state the policy keeps.
-    fn corporate_action(&mut self, acct: &Account, i: usize, ratio: f64);
+    fn corporate_action(&mut self, acct: &Account, asset: usize, ratio: f64);
 
     /// A new trading day opens: settlement releases.
     fn new_day(&mut self, acct: &Account);
@@ -36,7 +36,7 @@ pub trait Bookkeeping {
 
     /// Whether the policy keeps nothing for tranche `k`'s name `i` — the
     /// account forgets a name once its own cell and the policy's are at rest.
-    fn at_rest(&self, k: usize, i: usize) -> bool;
+    fn at_rest(&self, tranche: usize, asset: usize) -> bool;
 }
 
 /// The framework's own policy.
@@ -52,7 +52,7 @@ pub trait Bookkeeping {
 /// day (`audit`).
 pub struct Plain {
     tranches: usize,
-    n: usize,
+    assets: usize,
     /// `(K, N)` units each tranche may still sell today.
     budget: Vec<f64>,
     /// `(K, N)` cash locked behind each standing buy.
@@ -63,8 +63,8 @@ pub struct Plain {
 
 impl Plain {
     #[inline]
-    fn at(&self, k: usize, i: usize) -> usize {
-        k * self.n + i
+    fn at(&self, tranche: usize, asset: usize) -> usize {
+        tranche * self.assets + asset
     }
 
     /// Free one cell's locked cash.
@@ -83,46 +83,61 @@ impl Plain {
     }
 
     /// Size one tranche's decision against what it can reach.
-    fn size(&mut self, acct: &mut Account, inp: &Inputs, k: usize, d: usize, at: Point) {
-        let r = acct.r;
-        let row = acct.row_names(inp, k, d);
+    fn size(
+        &mut self,
+        acct: &mut Account,
+        inp: &Inputs,
+        tranche: usize,
+        decision: usize,
+        at: Point,
+    ) {
+        let run = acct.run;
+        let row = acct.row_names(inp, tranche, decision);
         let mut share = 0.0f64;
-        for &i in row.iter() {
-            let w = inp.plan[(r, k, d, i)];
-            if !w.is_nan() {
-                share += w.abs();
+        for &asset in row.iter() {
+            let weight = inp.plan[(run, tranche, decision, asset)];
+            if !weight.is_nan() {
+                share += weight.abs();
             }
         }
-        let reachable = acct.holding(inp, k, at) + self.spendable(acct);
+        let reachable = acct.holding(inp, tranche, at) + self.spendable(acct);
         let investable = acct.investable(inp, share, reachable);
         // The row's names and the book's: any other name strikes zero on a
         // zero weight and holds nothing, so its cell is already at rest.
-        for i in merged(&row, acct.named(k)) {
-            let want = acct.strike(inp, k, i, inp.plan[(r, k, d, i)], investable, at);
-            let cell = acct.at(k, i);
+        for asset in merged(&row, acct.named(tranche)) {
+            let want = acct.strike(
+                inp,
+                tranche,
+                asset,
+                inp.plan[(run, tranche, decision, asset)],
+                investable,
+                at,
+            );
+            let cell = acct.at(tranche, asset);
             acct.target[cell] = want;
             // A reduction the day's budget cannot cover is refused in part:
             // it sells what it may, and the book stays between answers.
             let give = acct.qty[cell] - want;
-            acct.blocked[cell] = inp.audit && acct.qty[cell] > 0.0 && give > self.budget[self.at(k, i)];
+            acct.blocked[cell] =
+                inp.audit && acct.qty[cell] > 0.0 && give > self.budget[self.at(tranche, asset)];
             if want != 0.0 || acct.blocked[cell] {
-                acct.touch(k, i);
+                acct.touch(tranche, asset);
             }
         }
     }
 
     /// One tranche's sells at this point.
-    fn sell(&mut self, acct: &mut Account, inp: &Inputs, k: usize, at: Point) {
-        let (t, phase, e) = (at.t, at.phase, at.e);
-        for idx in 0..acct.named(k).len() {
-            let i = acct.named(k)[idx];
-            let p = inp.price(phase, t, i);
-            if p.is_nan() || p <= 0.0 {
+    fn sell(&mut self, acct: &mut Account, inp: &Inputs, tranche: usize, at: Point) {
+        let (bar, phase, epoch) = (at.bar, at.phase, at.epoch);
+        for idx in 0..acct.named(tranche).len() {
+            let asset = acct.named(tranche)[idx];
+            let price = inp.price(phase, bar, asset);
+            if price.is_nan() || price <= 0.0 {
                 continue;
             }
-            let cell = acct.at(k, i);
+            let cell = acct.at(tranche, asset);
             let mut give = acct.qty[cell] - acct.target[cell];
-            if give <= 0.0 || !inp.sellable(phase, t, i) {
+            if give <= 0.0 || !inp.sellable(phase, bar, asset) {
                 continue;
             }
             if acct.blocked[cell] && give > self.budget[cell] {
@@ -133,9 +148,14 @@ impl Plain {
             if give <= 0.0 {
                 continue;
             }
-            let c = inp.class(i);
-            let turnover = give * p * inp.rate(MULTIPLIER, e, c);
-            let fee = inp.fee(turnover, inp.rate(SELL_FEE, e, c), e, c);
+            let category = inp.class(asset);
+            let turnover = give * price * inp.rate(MULTIPLIER, epoch, category);
+            let fee = inp.fee(
+                turnover,
+                inp.rate(SELL_FEE, epoch, category),
+                epoch,
+                category,
+            );
             acct.qty[cell] -= give;
             if inp.audit && acct.qty[cell] + give > 0.0 {
                 self.budget[cell] -= give;
@@ -149,37 +169,45 @@ impl Plain {
     /// What one name's buy costs at this point, cut to what cash covers.
     ///
     /// Returns `(units, turnover, fee)`, units zero when nothing fits.
-    fn affordable(&self, acct: &Account, inp: &Inputs, k: usize, i: usize, at: Point) -> (f64, f64, f64) {
-        let (t, phase, e) = (at.t, at.phase, at.e);
-        let p = inp.price(phase, t, i);
-        let cell = acct.at(k, i);
+    fn affordable(
+        &self,
+        acct: &Account,
+        inp: &Inputs,
+        tranche: usize,
+        asset: usize,
+        at: Point,
+    ) -> (f64, f64, f64) {
+        let (bar, phase, epoch) = (at.bar, at.phase, at.epoch);
+        let price = inp.price(phase, bar, asset);
+        let cell = acct.at(tranche, asset);
         let mut take = acct.target[cell] - acct.qty[cell];
-        if take <= 0.0 || p.is_nan() || p <= 0.0 {
+        if take <= 0.0 || price.is_nan() || price <= 0.0 {
             return (0.0, 0.0, 0.0);
         }
-        let c = inp.class(i);
-        let unit = p * inp.rate(MULTIPLIER, e, c);
-        let rate = inp.rate(BUY_FEE, e, c);
-        let lot = inp.rate(LOT, e, c);
+        let category = inp.class(asset);
+        let unit = price * inp.rate(MULTIPLIER, epoch, category);
+        let rate = inp.rate(BUY_FEE, epoch, category);
+        let lot = inp.rate(LOT, epoch, category);
         // Whole lots the cash covers, fees included; the fee floor can push
         // a full-cash order over by a few yuan, so back off a lot until it
         // fits.
         let spendable = self.spendable(acct);
         let per_unit = unit * (1.0 + rate);
-        let mut fitting = ((spendable - inp.rate(FIXED_FEE, e, c)) / per_unit / lot).floor() * lot;
+        let mut fitting =
+            ((spendable - inp.rate(FIXED_FEE, epoch, category)) / per_unit / lot).floor() * lot;
         if fitting < take {
             take = fitting;
         }
         let mut turnover = take * unit;
-        let mut fee = inp.fee(turnover, rate, e, c);
+        let mut fee = inp.fee(turnover, rate, epoch, category);
         // An infinite target would back off one lot at a time forever.
         while take > 0.0 && take.is_finite() && turnover + fee > spendable {
             fitting -= lot;
             take = fitting;
             turnover = take * unit;
-            fee = inp.fee(turnover, rate, e, c);
+            fee = inp.fee(turnover, rate, epoch, category);
         }
-        if take <= 0.0 || acct.qty[cell] + take < inp.rate(MIN_LOT, e, c) {
+        if take <= 0.0 || acct.qty[cell] + take < inp.rate(MIN_LOT, epoch, category) {
             return (0.0, 0.0, 0.0);
         }
         (take, turnover, fee)
@@ -187,21 +215,21 @@ impl Plain {
 
     /// One buy for one name: fill what fits, or lock its cash behind a
     /// standing order when the market blocks it.
-    fn buy(&mut self, acct: &mut Account, inp: &Inputs, k: usize, i: usize, at: Point) {
-        let (take, turnover, fee) = self.affordable(acct, inp, k, i, at);
+    fn buy(&mut self, acct: &mut Account, inp: &Inputs, tranche: usize, asset: usize, at: Point) {
+        let (take, turnover, fee) = self.affordable(acct, inp, tranche, asset, at);
         if take <= 0.0 {
             return;
         }
-        let cell = acct.at(k, i);
-        acct.touch(k, i);
-        if !inp.buyable(at.phase, at.t, i) {
+        let cell = acct.at(tranche, asset);
+        acct.touch(tranche, asset);
+        if !inp.buyable(at.phase, at.bar, asset) {
             let cost = turnover + fee;
             self.locked[cell] = cost;
             self.locked_total += cost;
             return;
         }
         acct.qty[cell] += take;
-        if inp.flags[(SAME_BAR, inp.class(i))] {
+        if inp.flags[(SAME_BAR, inp.class(asset))] {
             self.budget[cell] += take;
         }
         acct.cash -= turnover + fee;
@@ -211,19 +239,19 @@ impl Plain {
 }
 
 impl Bookkeeping for Plain {
-    fn new(tranches: usize, n: usize) -> Self {
+    fn new(tranches: usize, assets: usize) -> Self {
         Plain {
             tranches,
-            n,
-            budget: vec![0.0; tranches * n],
-            locked: vec![0.0; tranches * n],
+            assets,
+            budget: vec![0.0; tranches * assets],
+            locked: vec![0.0; tranches * assets],
             locked_total: 0.0,
         }
     }
 
-    fn corporate_action(&mut self, _acct: &Account, i: usize, ratio: f64) {
-        for k in 0..self.tranches {
-            let cell = self.at(k, i);
+    fn corporate_action(&mut self, _acct: &Account, asset: usize, ratio: f64) {
+        for tranche in 0..self.tranches {
+            let cell = self.at(tranche, asset);
             if self.budget[cell] != 0.0 {
                 self.budget[cell] *= ratio;
             }
@@ -231,9 +259,9 @@ impl Bookkeeping for Plain {
     }
 
     fn new_day(&mut self, acct: &Account) {
-        for k in 0..self.tranches {
-            for &i in acct.named(k) {
-                let cell = self.at(k, i);
+        for tranche in 0..self.tranches {
+            for &asset in acct.named(tranche) {
+                let cell = self.at(tranche, asset);
                 self.budget[cell] = acct.qty[cell];
             }
         }
@@ -245,54 +273,54 @@ impl Bookkeeping for Plain {
         // A standing order tries again where the market lets it: its cash
         // comes back to the account and the fill is checked against the
         // point's own price.
-        for k in 0..self.tranches {
-            for idx in 0..acct.named(k).len() {
-                let i = acct.named(k)[idx];
-                let cell = self.at(k, i);
-                if self.locked[cell] <= 0.0 || !inp.buyable(at.phase, at.t, i) {
+        for tranche in 0..self.tranches {
+            for idx in 0..acct.named(tranche).len() {
+                let asset = acct.named(tranche)[idx];
+                let cell = self.at(tranche, asset);
+                if self.locked[cell] <= 0.0 || !inp.buyable(at.phase, at.bar, asset) {
                     continue;
                 }
                 self.release(cell);
-                self.buy(acct, inp, k, i, at);
+                self.buy(acct, inp, tranche, asset, at);
             }
         }
     }
 
     fn decide_and_trade(&mut self, acct: &mut Account, inp: &Inputs, at: Point) {
-        for k in 0..self.tranches {
-            let d = acct.fire[k];
-            if d < 0 {
+        for tranche in 0..self.tranches {
+            let decision = acct.fire[tranche];
+            if decision < 0 {
                 continue;
             }
-            let d = d as usize;
+            let decision = decision as usize;
             // A fresh decision replaces whatever stood: its orders are
             // withdrawn and their cash is reachable again.
-            for idx in 0..acct.named(k).len() {
-                let cell = self.at(k, acct.named(k)[idx]);
+            for idx in 0..acct.named(tranche).len() {
+                let cell = self.at(tranche, acct.named(tranche)[idx]);
                 self.release(cell);
             }
-            self.size(acct, inp, k, d, at);
-            self.sell(acct, inp, k, at);
-            for idx in 0..acct.named(k).len() {
-                let i = acct.named(k)[idx];
-                self.buy(acct, inp, k, i, at);
+            self.size(acct, inp, tranche, decision, at);
+            self.sell(acct, inp, tranche, at);
+            for idx in 0..acct.named(tranche).len() {
+                let asset = acct.named(tranche)[idx];
+                self.buy(acct, inp, tranche, asset, at);
             }
-            acct.remember_attained(inp, k, d);
+            acct.remember_attained(inp, tranche, decision);
         }
     }
 
     fn close_bar(&mut self, acct: &mut Account) {
         // Standing orders expire with the bar; their cash is free again.
-        for k in 0..self.tranches {
-            for idx in 0..acct.named(k).len() {
-                let cell = self.at(k, acct.named(k)[idx]);
+        for tranche in 0..self.tranches {
+            for idx in 0..acct.named(tranche).len() {
+                let cell = self.at(tranche, acct.named(tranche)[idx]);
                 self.release(cell);
             }
         }
     }
 
-    fn at_rest(&self, k: usize, i: usize) -> bool {
-        let cell = self.at(k, i);
+    fn at_rest(&self, tranche: usize, asset: usize) -> bool {
+        let cell = self.at(tranche, asset);
         self.budget[cell] == 0.0 && self.locked[cell] == 0.0
     }
 }

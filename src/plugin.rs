@@ -61,10 +61,13 @@ pub struct SimulateKwargs {
 pub fn output_field(name: &str, positions: bool) -> Field {
     let mut fields: Vec<Field> = ["equity", "cash", "fees", "bought", "sold"]
         .into_iter()
-        .map(|f| Field::new(f.into(), DataType::Float64))
+        .map(|firing| Field::new(firing.into(), DataType::Float64))
         .collect();
     if positions {
-        fields.push(Field::new("position".into(), DataType::List(Box::new(DataType::Float64))));
+        fields.push(Field::new(
+            "position".into(),
+            DataType::List(Box::new(DataType::Float64)),
+        ));
     }
     Field::new(name.into(), DataType::Struct(fields))
 }
@@ -90,9 +93,12 @@ impl Plane {
     fn view(&self, steps: usize, width: usize) -> PolarsResult<ArrayView2<'_, f64>> {
         match self {
             Plane::Flat(values) => {
-                let slice = values.cont_slice().map_err(|e| polars_err!(ComputeError: "not contiguous: {e}"))?;
-                ArrayView2::from_shape((steps, width), slice)
-                    .map_err(|e| polars_err!(ComputeError: "list column does not reshape: {e}"))
+                let slice = values
+                    .cont_slice()
+                    .map_err(|error| polars_err!(ComputeError: "not contiguous: {error}"))?;
+                ArrayView2::from_shape((steps, width), slice).map_err(
+                    |error| polars_err!(ComputeError: "list column does not reshape: {error}"),
+                )
             }
             Plane::Owned(matrix) => Ok(matrix.view()),
         }
@@ -103,18 +109,22 @@ impl Plane {
 fn floats(column: &Series, steps: usize, width: usize) -> PolarsResult<Plane> {
     let list = column.list()?;
     if list.null_count() == 0 {
-        let flat = list.explode(ExplodeOptions { empty_as_null: false, keep_nulls: false })?;
+        let flat = list.explode(ExplodeOptions {
+            empty_as_null: false,
+            keep_nulls: false,
+        })?;
         let values = flat.f64()?.rechunk().into_owned();
-        if values.null_count() == 0 && values.len() == steps * width && values.cont_slice().is_ok() {
+        if values.null_count() == 0 && values.len() == steps * width && values.cont_slice().is_ok()
+        {
             return Ok(Plane::Flat(values));
         }
     }
     let mut out = Array2::<f64>::from_elem((steps, width), f64::NAN);
-    for (t, row) in list.amortized_iter().enumerate() {
+    for (bar, row) in list.amortized_iter().enumerate() {
         if let Some(inner) = row {
             let values = inner.as_ref().f64()?;
-            for (i, v) in values.iter().enumerate() {
-                out[(t, i)] = v.unwrap_or(f64::NAN);
+            for (asset, value) in values.iter().enumerate() {
+                out[(bar, asset)] = value.unwrap_or(f64::NAN);
             }
         }
     }
@@ -126,21 +136,27 @@ fn booleans(column: &Series, steps: usize, width: usize) -> PolarsResult<Array2<
     let list = column.list()?;
     let mut out = Array2::<bool>::from_elem((steps, width), false);
     if list.null_count() == 0 {
-        let flat = list.explode(ExplodeOptions { empty_as_null: false, keep_nulls: false })?;
+        let flat = list.explode(ExplodeOptions {
+            empty_as_null: false,
+            keep_nulls: false,
+        })?;
         let values = flat.bool()?.rechunk();
         if values.len() == steps * width && values.null_count() == 0 {
             let cells = out.as_slice_mut().expect("fresh matrix is contiguous");
-            for (cell, bit) in cells.iter_mut().zip(values.downcast_iter().flat_map(|arr| arr.values_iter())) {
+            for (cell, bit) in cells
+                .iter_mut()
+                .zip(values.downcast_iter().flat_map(|arr| arr.values_iter()))
+            {
                 *cell = bit;
             }
             return Ok(out);
         }
     }
-    for (t, row) in list.amortized_iter().enumerate() {
+    for (bar, row) in list.amortized_iter().enumerate() {
         if let Some(inner) = row {
             let values = inner.as_ref().bool()?;
-            for (i, v) in values.iter().enumerate() {
-                out[(t, i)] = v.unwrap_or(false);
+            for (asset, value) in values.iter().enumerate() {
+                out[(bar, asset)] = value.unwrap_or(false);
             }
         }
     }
@@ -157,13 +173,21 @@ fn boolean_planes(
     default: bool,
 ) -> PolarsResult<Vec<Array2<bool>>> {
     match which {
-        Some(which) => which.iter().map(|&index| booleans(&inputs[index], steps, width)).collect(),
-        None => Ok((0..points).map(|_| Array2::<bool>::from_elem((steps, width), default)).collect()),
+        Some(which) => which
+            .iter()
+            .map(|&index| booleans(&inputs[index], steps, width))
+            .collect(),
+        None => Ok((0..points)
+            .map(|_| Array2::<bool>::from_elem((steps, width), default))
+            .collect()),
     }
 }
 
 /// Walk one account under policy `B` and answer one struct per bar.
-pub fn simulate<B: Bookkeeping>(inputs: &[Series], kwargs: &SimulateKwargs) -> PolarsResult<Series> {
+pub fn simulate<B: Bookkeeping>(
+    inputs: &[Series],
+    kwargs: &SimulateKwargs,
+) -> PolarsResult<Series> {
     let steps = inputs[kwargs.mark].len();
     let width = width_of(&inputs[kwargs.mark])?;
     let points = kwargs.points;
@@ -178,7 +202,11 @@ pub fn simulate<B: Bookkeeping>(inputs: &[Series], kwargs: &SimulateKwargs) -> P
         Some(index) => floats(&inputs[index], steps, width)?,
         None => Plane::Owned(Array2::<f64>::zeros((steps, width))),
     };
-    let prices: Vec<Plane> = kwargs.prices.iter().map(|&index| floats(&inputs[index], steps, width)).collect::<PolarsResult<_>>()?;
+    let prices: Vec<Plane> = kwargs
+        .prices
+        .iter()
+        .map(|&index| floats(&inputs[index], steps, width))
+        .collect::<PolarsResult<_>>()?;
     let buyable = boolean_planes(inputs, kwargs.buyable.as_ref(), points, steps, width, true)?;
     let sellable = boolean_planes(inputs, kwargs.sellable.as_ref(), points, steps, width, true)?;
     let impound = boolean_planes(inputs, kwargs.impound.as_ref(), points, steps, width, false)?;
@@ -191,63 +219,67 @@ pub fn simulate<B: Bookkeeping>(inputs: &[Series], kwargs: &SimulateKwargs) -> P
     for firing in &kwargs.firings {
         let list = inputs[firing.plan].list()?;
         let mut found = Vec::new();
-        for (t, row) in list.amortized_iter().enumerate() {
+        for (bar, row) in list.amortized_iter().enumerate() {
             if row.is_some() {
-                found.push((t, 0));
+                found.push((bar, 0));
             }
         }
         firing_rows.push(found);
     }
     // Number the rows: firings of one tranche interleave by bar, then by point.
     let mut order: Vec<(usize, usize, usize, usize)> = Vec::new(); // (tranche, bar, point, firing index)
-    for (f, firing) in kwargs.firings.iter().enumerate() {
-        for &(t, _) in &firing_rows[f] {
-            order.push((firing.tranche, t, firing.point, f));
+    for (index, firing) in kwargs.firings.iter().enumerate() {
+        for &(bar, _) in &firing_rows[index] {
+            order.push((firing.tranche, bar, firing.point, index));
         }
     }
     order.sort();
     let mut row_of: Vec<Vec<usize>> = firing_rows.iter().map(|rows| vec![0; rows.len()]).collect();
-    let mut cursor: Vec<std::collections::HashMap<usize, usize>> = vec![Default::default(); kwargs.firings.len()];
-    for (f, rows) in firing_rows.iter().enumerate() {
-        for (j, &(t, _)) in rows.iter().enumerate() {
-            cursor[f].insert(t, j);
+    let mut cursor: Vec<std::collections::HashMap<usize, usize>> =
+        vec![Default::default(); kwargs.firings.len()];
+    for (firing, rows) in firing_rows.iter().enumerate() {
+        for (row, &(bar, _)) in rows.iter().enumerate() {
+            cursor[firing].insert(bar, row);
         }
     }
-    for &(k, t, _p, f) in &order {
-        let j = cursor[f][&t];
-        row_of[f][j] = rows_per_tranche[k];
-        rows_per_tranche[k] += 1;
+    for &(tranche, bar, _p, firing) in &order {
+        let row = cursor[firing][&bar];
+        row_of[firing][row] = rows_per_tranche[tranche];
+        rows_per_tranche[tranche] += 1;
     }
     let deepest = rows_per_tranche.iter().copied().max().unwrap_or(0).max(1);
     let mut plan = Array4::<f64>::zeros((1, tranches, deepest, width));
     let mut at = Array4::<i32>::from_elem((1, tranches, steps, points), -1);
     let mut standing = Array4::<bool>::from_elem((1, tranches, steps, points), false);
-    for (f, firing) in kwargs.firings.iter().enumerate() {
+    for (index, firing) in kwargs.firings.iter().enumerate() {
         let list = inputs[firing.plan].list()?;
         let flags = match firing.standing {
             Some(index) => Some(inputs[index].bool()?.clone()),
             None => None,
         };
-        let mut j = 0usize;
-        for (t, row) in list.amortized_iter().enumerate() {
+        let mut fired = 0usize;
+        for (bar, row) in list.amortized_iter().enumerate() {
             let Some(inner) = row else { continue };
-            let d = row_of[f][j];
-            j += 1;
+            let decision = row_of[index][fired];
+            fired += 1;
             let values = inner.as_ref().f64()?;
-            let mut target = plan.slice_mut(ndarray::s![0, firing.tranche, d, ..]);
+            let mut target = plan.slice_mut(ndarray::s![0, firing.tranche, decision, ..]);
             match values.cont_slice() {
                 Ok(slice) if slice.len() == width => {
-                    target.as_slice_mut().expect("plan row is contiguous").copy_from_slice(slice);
+                    target
+                        .as_slice_mut()
+                        .expect("plan row is contiguous")
+                        .copy_from_slice(slice);
                 }
                 _ => {
-                    for (i, v) in values.iter().enumerate() {
-                        target[i] = v.unwrap_or(0.0);
+                    for (asset, value) in values.iter().enumerate() {
+                        target[asset] = value.unwrap_or(0.0);
                     }
                 }
             }
-            at[(0, firing.tranche, t, firing.point)] = d as i32;
+            at[(0, firing.tranche, bar, firing.point)] = decision as i32;
             if let Some(flags) = &flags {
-                standing[(0, firing.tranche, t, firing.point)] = flags.get(t).unwrap_or(false);
+                standing[(0, firing.tranche, bar, firing.point)] = flags.get(bar).unwrap_or(false);
             }
         }
     }
@@ -259,30 +291,42 @@ pub fn simulate<B: Bookkeeping>(inputs: &[Series], kwargs: &SimulateKwargs) -> P
         for row in list.amortized_iter() {
             if let Some(inner) = row {
                 let values = inner.as_ref().i32()?;
-                for (i, v) in values.iter().enumerate() {
-                    codes[i] = v.unwrap_or(0);
+                for (asset, value) in values.iter().enumerate() {
+                    codes[asset] = value.unwrap_or(0);
                 }
                 break;
             }
         }
         codes
     };
-    let epoch: Array1<i32> = inputs[kwargs.epoch].i32()?.iter().map(|v| v.unwrap_or(0)).collect();
-    let new_day: Array1<bool> = inputs[kwargs.new_day].bool()?.iter().map(|v| v.unwrap_or(false)).collect();
-    let epochs = kwargs.rates.first().map(|e| e.len()).unwrap_or(0);
-    let classes = kwargs.flags.first().map(|c| c.len()).unwrap_or(0);
+    let epoch: Array1<i32> = inputs[kwargs.epoch]
+        .i32()?
+        .iter()
+        .map(|value| value.unwrap_or(0))
+        .collect();
+    let new_day: Array1<bool> = inputs[kwargs.new_day]
+        .bool()?
+        .iter()
+        .map(|value| value.unwrap_or(false))
+        .collect();
+    let epochs = kwargs.rates.first().map(|error| error.len()).unwrap_or(0);
+    let classes = kwargs
+        .flags
+        .first()
+        .map(|category| category.len())
+        .unwrap_or(0);
     let mut rates = Array3::<f64>::zeros((kwargs.rates.len(), epochs, classes));
-    for (r, by_epoch) in kwargs.rates.iter().enumerate() {
-        for (e, by_class) in by_epoch.iter().enumerate() {
-            for (c, &v) in by_class.iter().enumerate() {
-                rates[(r, e, c)] = v;
+    for (run, by_epoch) in kwargs.rates.iter().enumerate() {
+        for (error, by_class) in by_epoch.iter().enumerate() {
+            for (category, &value) in by_class.iter().enumerate() {
+                rates[(run, error, category)] = value;
             }
         }
     }
     let mut flags = Array2::<bool>::from_elem((kwargs.flags.len(), classes), false);
-    for (r, by_class) in kwargs.flags.iter().enumerate() {
-        for (c, &v) in by_class.iter().enumerate() {
-            flags[(r, c)] = v;
+    for (run, by_class) in kwargs.flags.iter().enumerate() {
+        for (category, &value) in by_class.iter().enumerate() {
+            flags[(run, category)] = value;
         }
     }
 
@@ -290,7 +334,10 @@ pub fn simulate<B: Bookkeeping>(inputs: &[Series], kwargs: &SimulateKwargs) -> P
         plan: plan.view(),
         at: at.view(),
         standing: standing.view(),
-        prices: prices.iter().map(|plane| plane.view(steps, width)).collect::<PolarsResult<_>>()?,
+        prices: prices
+            .iter()
+            .map(|plane| plane.view(steps, width))
+            .collect::<PolarsResult<_>>()?,
         mark: mark.view(steps, width)?,
         impound: impound.iter().map(|plane| plane.view()).collect(),
         previous: previous.view(steps, width)?,
@@ -309,7 +356,7 @@ pub fn simulate<B: Bookkeeping>(inputs: &[Series], kwargs: &SimulateKwargs) -> P
     };
     let (reported, held) = run_all::<B>(&run);
     let series = |row: usize, name: &str| -> Series {
-        let values: Vec<f64> = (0..steps).map(|t| reported[(row, 0, t)]).collect();
+        let values: Vec<f64> = (0..steps).map(|bar| reported[(row, 0, bar)]).collect();
         Series::new(name.into(), values)
     };
     let mut fields = vec![

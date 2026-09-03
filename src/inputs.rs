@@ -71,46 +71,46 @@ impl<'a> Inputs<'a> {
 
     /// The price at one point of one bar for one instrument.
     #[inline]
-    pub fn price(&self, phase: usize, t: usize, i: usize) -> f64 {
-        self.prices[phase][(t, i)]
+    pub fn price(&self, phase: usize, bar: usize, asset: usize) -> f64 {
+        self.prices[phase][(bar, asset)]
     }
 
     /// Whether a buy can fill there.
     #[inline]
-    pub fn buyable(&self, phase: usize, t: usize, i: usize) -> bool {
-        self.buyable[phase][(t, i)]
+    pub fn buyable(&self, phase: usize, bar: usize, asset: usize) -> bool {
+        self.buyable[phase][(bar, asset)]
     }
 
     /// Whether a sell can fill there.
     #[inline]
-    pub fn sellable(&self, phase: usize, t: usize, i: usize) -> bool {
-        self.sellable[phase][(t, i)]
+    pub fn sellable(&self, phase: usize, bar: usize, asset: usize) -> bool {
+        self.sellable[phase][(bar, asset)]
     }
 
     /// Whether a holding is stuck at the limit there.
     #[inline]
-    pub fn impound(&self, phase: usize, t: usize, i: usize) -> bool {
-        self.impound[phase][(t, i)]
+    pub fn impound(&self, phase: usize, bar: usize, asset: usize) -> bool {
+        self.impound[phase][(bar, asset)]
     }
 
     /// The instrument's class code.
     #[inline]
-    pub fn class(&self, i: usize) -> usize {
-        self.instrument[i] as usize
+    pub fn class(&self, asset: usize) -> usize {
+        self.instrument[asset] as usize
     }
 
     /// One rate for one instrument under one epoch.
     #[inline]
-    pub fn rate(&self, row: usize, e: usize, c: usize) -> f64 {
-        self.rates[(row, e, c)]
+    pub fn rate(&self, row: usize, epoch: usize, category: usize) -> f64 {
+        self.rates[(row, epoch, category)]
     }
 
     /// A fee on one fill: proportional plus fixed, floored at the minimum.
     #[inline]
-    pub fn fee(&self, turnover: f64, rate: f64, e: usize, c: usize) -> f64 {
-        let mut fee = turnover * rate + self.rates[(FIXED_FEE, e, c)];
-        if fee < self.rates[(MIN_FEE, e, c)] {
-            fee = self.rates[(MIN_FEE, e, c)];
+    pub fn fee(&self, turnover: f64, rate: f64, epoch: usize, category: usize) -> f64 {
+        let mut fee = turnover * rate + self.rates[(FIXED_FEE, epoch, category)];
+        if fee < self.rates[(MIN_FEE, epoch, category)] {
+            fee = self.rates[(MIN_FEE, epoch, category)];
         }
         fee
     }
@@ -153,7 +153,7 @@ pub fn decide(
 /// makes it impossible to hand a bar's epoch to another bar's point.
 #[derive(Clone, Copy, Debug)]
 pub struct Point {
-    pub t: usize,
+    pub bar: usize,
     pub phase: usize,
-    pub e: usize,
+    pub epoch: usize,
 }

@@ -8,25 +8,30 @@ use crate::bookkeeping::Bookkeeping;
 use crate::inputs::*;
 
 /// Run one account: every tranche, every bar, under one policy.
-pub fn run_account<B: Bookkeeping>(r: usize, inp: &Inputs, reported: &mut [f64], positions: &mut [f64]) {
+pub fn run_account<B: Bookkeeping>(
+    run: usize,
+    inp: &Inputs,
+    reported: &mut [f64],
+    positions: &mut [f64],
+) {
     let tranches = inp.plan.shape()[1];
-    let n = inp.plan.shape()[3];
+    let assets = inp.plan.shape()[3];
     let phases = inp.points();
     let steps = inp.steps();
 
-    let mut acct = Account::new(r, tranches, n, inp.capital);
-    let mut book = B::new(tranches, n);
+    let mut acct = Account::new(run, tranches, assets, inp.capital);
+    let mut book = B::new(tranches, assets);
     let mut scaled: Vec<(usize, f64)> = Vec::new();
 
-    for t in 0..steps {
-        let e = inp.epoch[t] as usize;
+    for bar in 0..steps {
+        let epoch = inp.epoch[bar] as usize;
 
-        acct.mark_previous(inp, t, &mut scaled);
-        for &(i, ratio) in scaled.iter() {
-            book.corporate_action(&acct, i, ratio);
+        acct.mark_previous(inp, bar, &mut scaled);
+        for &(asset, ratio) in scaled.iter() {
+            book.corporate_action(&acct, asset, ratio);
         }
         // Settlement releases on the day boundary, not the bar boundary.
-        if inp.new_day[t] {
+        if inp.new_day[bar] {
             book.new_day(&acct);
         }
         acct.open_bar();
@@ -34,7 +39,7 @@ pub fn run_account<B: Bookkeeping>(r: usize, inp: &Inputs, reported: &mut [f64],
 
         // The auction: each price point of the bar, in order.
         for phase in 0..phases {
-            let at = Point { t, phase, e };
+            let at = Point { bar, phase, epoch };
             acct.mark_point(inp, at);
             let deciding = acct.resolve_firings(inp, at);
             acct.pool_sell(inp, at);
@@ -46,8 +51,18 @@ pub fn run_account<B: Bookkeeping>(r: usize, inp: &Inputs, reported: &mut [f64],
         }
 
         book.close_bar(&mut acct);
-        acct.close_bar(inp, Point { t, phase: phases - 1, e }, reported, positions, steps);
-        acct.sweep(|k, i| book.at_rest(k, i));
+        acct.close_bar(
+            inp,
+            Point {
+                bar,
+                phase: phases - 1,
+                epoch,
+            },
+            reported,
+            positions,
+            steps,
+        );
+        acct.sweep(|tranche, asset| book.at_rest(tranche, asset));
     }
 }
 
@@ -58,12 +73,12 @@ pub fn run_account<B: Bookkeeping>(r: usize, inp: &Inputs, reported: &mut [f64],
 pub fn run_all<B: Bookkeeping>(inputs: &Inputs) -> (Array3<f64>, Array3<f64>) {
     let runs = inputs.plan.shape()[0];
     let steps = inputs.steps();
-    let n = inputs.plan.shape()[3];
+    let assets = inputs.plan.shape()[3];
     let record_positions = inputs.record_positions;
 
     let mut reported = Array3::<f64>::zeros((runs, REPORTED, steps));
     let mut positions = if record_positions {
-        Array3::<f64>::zeros((runs, steps, n))
+        Array3::<f64>::zeros((runs, steps, assets))
     } else {
         Array3::<f64>::zeros((1, 1, 1))
     };
@@ -74,9 +89,9 @@ pub fn run_all<B: Bookkeeping>(inputs: &Inputs) -> (Array3<f64>, Array3<f64>) {
             .zip(positions.axis_iter_mut(Axis(0)))
             .enumerate()
             .par_bridge()
-            .for_each(|(r, (mut rep, mut pos))| {
+            .for_each(|(run, (mut rep, mut pos))| {
                 run_account::<B>(
-                    r,
+                    run,
                     inputs,
                     rep.as_slice_mut().expect("contiguous"),
                     pos.as_slice_mut().expect("contiguous"),
@@ -88,9 +103,9 @@ pub fn run_all<B: Bookkeeping>(inputs: &Inputs) -> (Array3<f64>, Array3<f64>) {
             .zip(dummies.iter_mut())
             .enumerate()
             .par_bridge()
-            .for_each(|(r, (mut rep, dummy))| {
+            .for_each(|(run, (mut rep, dummy))| {
                 run_account::<B>(
-                    r,
+                    run,
                     inputs,
                     rep.as_slice_mut().expect("contiguous"),
                     dummy.as_slice_mut().expect("contiguous"),
@@ -100,10 +115,10 @@ pub fn run_all<B: Bookkeeping>(inputs: &Inputs) -> (Array3<f64>, Array3<f64>) {
 
     // Reported comes back as (5, runs, steps) for the caller's indexing.
     let mut packed = Array3::<f64>::zeros((REPORTED, runs, steps));
-    for r in 0..runs {
-        for s in 0..REPORTED {
-            for t in 0..steps {
-                packed[(s, r, t)] = reported[(r, s, t)];
+    for run in 0..runs {
+        for series in 0..REPORTED {
+            for bar in 0..steps {
+                packed[(series, run, bar)] = reported[(run, series, bar)];
             }
         }
     }

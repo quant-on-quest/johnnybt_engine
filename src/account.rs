@@ -11,9 +11,9 @@ use crate::inputs::*;
 /// One account's state, for one run.
 pub struct Account {
     /// Which run this account is.
-    pub r: usize,
+    pub run: usize,
     pub tranches: usize,
-    pub n: usize,
+    pub assets: usize,
     /// The account's cash. Policies move money in and out of it.
     pub cash: f64,
     /// `(K, N)` what each tranche holds, in units.
@@ -54,20 +54,20 @@ pub struct Account {
 }
 
 impl Account {
-    pub fn new(r: usize, tranches: usize, n: usize, capital: f64) -> Self {
+    pub fn new(run: usize, tranches: usize, assets: usize, capital: f64) -> Self {
         Account {
-            r,
+            run,
             tranches,
-            n,
+            assets,
             cash: capital,
-            qty: vec![0.0; tranches * n],
-            target: vec![0.0; tranches * n],
-            liq: vec![0.0; n],
-            last: vec![0.0; n],
-            attained: vec![f64::NAN; tranches * n],
+            qty: vec![0.0; tranches * assets],
+            target: vec![0.0; tranches * assets],
+            liq: vec![0.0; assets],
+            last: vec![0.0; assets],
+            attained: vec![f64::NAN; tranches * assets],
             attained_row: vec![-1; tranches],
             fire: vec![-1; tranches],
-            blocked: vec![false; tranches * n],
+            blocked: vec![false; tranches * assets],
             active: vec![Vec::new(); tranches],
             pool: Vec::new(),
             fees: 0.0,
@@ -79,34 +79,36 @@ impl Account {
 
     /// The flat index of tranche `k`, name `i`.
     #[inline]
-    pub fn at(&self, k: usize, i: usize) -> usize {
-        k * self.n + i
+    pub fn at(&self, tranche: usize, asset: usize) -> usize {
+        tranche * self.assets + asset
     }
 
     /// Note that tranche `k` is doing something with name `i`.
     #[inline]
-    pub fn touch(&mut self, k: usize, i: usize) {
-        insert_sorted(&mut self.active[k], i);
+    pub fn touch(&mut self, tranche: usize, asset: usize) {
+        insert_sorted(&mut self.active[tranche], asset);
     }
 
     /// The names tranche `k` is doing something with, ascending.
     #[inline]
-    pub fn named(&self, k: usize) -> &[usize] {
-        &self.active[k]
+    pub fn named(&self, tranche: usize) -> &[usize] {
+        &self.active[tranche]
     }
 
     /// The names a decision row weights, ascending — a missing weight
     /// (NaN, "keep the book") names the instrument too.
-    pub fn row_names(&self, inp: &Inputs, k: usize, d: usize) -> Vec<usize> {
-        let r = self.r;
-        (0..self.n).filter(|&i| inp.plan[(r, k, d, i)] != 0.0).collect()
+    pub fn row_names(&self, inp: &Inputs, tranche: usize, decision: usize) -> Vec<usize> {
+        let run = self.run;
+        (0..self.assets)
+            .filter(|&asset| inp.plan[(run, tranche, decision, asset)] != 0.0)
+            .collect()
     }
 
     /// Every name any book or the pool holds, ascending.
     pub fn union_names(&self) -> Vec<usize> {
         let mut out = self.pool.clone();
-        for k in 0..self.tranches {
-            out = merged(&out, &self.active[k]);
+        for tranche in 0..self.tranches {
+            out = merged(&out, &self.active[tranche]);
         }
         out
     }
@@ -114,20 +116,23 @@ impl Account {
     /// Forget the names whose cells are back at rest: nothing held, no
     /// target, no refusal, and nothing the policy keeps for them.
     pub fn sweep(&mut self, at_rest: impl Fn(usize, usize) -> bool) {
-        for k in 0..self.tranches {
-            let n = self.n;
+        for tranche in 0..self.tranches {
+            let assets = self.assets;
             let (qty, target, blocked) = (&self.qty, &self.target, &self.blocked);
-            self.active[k].retain(|&i| {
-                let cell = k * n + i;
-                !(qty[cell] == 0.0 && target[cell] == 0.0 && !blocked[cell] && at_rest(k, i))
+            self.active[tranche].retain(|&asset| {
+                let cell = tranche * assets + asset;
+                !(qty[cell] == 0.0
+                    && target[cell] == 0.0
+                    && !blocked[cell]
+                    && at_rest(tranche, asset))
             });
         }
     }
 
     /// The value of one name's `units` at its last quote.
     #[inline]
-    pub fn worth(&self, inp: &Inputs, at: Point, i: usize, units: f64) -> f64 {
-        units * self.last[i] * inp.rate(MULTIPLIER, at.e, inp.class(i))
+    pub fn worth(&self, inp: &Inputs, at: Point, asset: usize, units: f64) -> f64 {
+        units * self.last[asset] * inp.rate(MULTIPLIER, at.epoch, inp.class(asset))
     }
 
     /// Before the bar opens, a holding is worth the exchange's reference
@@ -135,40 +140,40 @@ impl Account {
     ///
     /// Returns each scaled name with its ratio, for the policy to scale its
     /// own per-name state by.
-    pub fn mark_previous(&mut self, inp: &Inputs, t: usize, scaled: &mut Vec<(usize, f64)>) {
+    pub fn mark_previous(&mut self, inp: &Inputs, bar: usize, scaled: &mut Vec<(usize, f64)>) {
         scaled.clear();
         if !inp.has_previous {
             return;
         }
-        for i in 0..self.n {
-            let q = inp.previous[(t, i)];
-            if !q.is_nan() && q > 0.0 {
-                let base = self.last[i];
-                if base > 0.0 && base != q {
-                    let ratio = base / q;
-                    for k in 0..self.tranches {
-                        let cell = self.at(k, i);
+        for asset in 0..self.assets {
+            let quote = inp.previous[(bar, asset)];
+            if !quote.is_nan() && quote > 0.0 {
+                let base = self.last[asset];
+                if base > 0.0 && base != quote {
+                    let ratio = base / quote;
+                    for tranche in 0..self.tranches {
+                        let cell = self.at(tranche, asset);
                         if self.qty[cell] != 0.0 {
                             self.qty[cell] *= ratio;
                             self.target[cell] *= ratio;
                         }
                     }
-                    if self.liq[i] > 0.0 {
-                        self.liq[i] *= ratio;
+                    if self.liq[asset] > 0.0 {
+                        self.liq[asset] *= ratio;
                     }
-                    scaled.push((i, ratio));
+                    scaled.push((asset, ratio));
                 }
-                self.last[i] = q;
+                self.last[asset] = quote;
             }
         }
     }
 
     /// Everything the account holds in one name, tranches and pool alike.
     #[inline]
-    pub fn held(&self, i: usize) -> f64 {
-        let mut total = self.liq[i];
-        for k in 0..self.tranches {
-            total += self.qty[self.at(k, i)];
+    pub fn held(&self, asset: usize) -> f64 {
+        let mut total = self.liq[asset];
+        for tranche in 0..self.tranches {
+            total += self.qty[self.at(tranche, asset)];
         }
         total
     }
@@ -182,10 +187,10 @@ impl Account {
 
     /// A price point quotes: every name with a price is worth that now.
     pub fn mark_point(&mut self, inp: &Inputs, at: Point) {
-        for i in 0..self.n {
-            let p = inp.price(at.phase, at.t, i);
-            if !p.is_nan() && p > 0.0 {
-                self.last[i] = p;
+        for asset in 0..self.assets {
+            let price = inp.price(at.phase, at.bar, asset);
+            if !price.is_nan() && price > 0.0 {
+                self.last[asset] = price;
             }
         }
     }
@@ -203,39 +208,39 @@ impl Account {
     ///
     /// Returns whether anybody decides here.
     pub fn resolve_firings(&mut self, inp: &Inputs, at: Point) -> bool {
-        let (r, t, phase) = (self.r, at.t, at.phase);
+        let (run, bar, phase) = (self.run, at.bar, at.phase);
         let mut deciding = false;
-        for k in 0..self.tranches {
-            let mut d = inp.at[(r, k, t, phase)];
-            if d >= 0 {
-                for idx in 0..self.active[k].len() {
-                    let i = self.active[k][idx];
-                    let cell = self.at(k, i);
-                    if inp.impound(phase, t, i) && self.qty[cell] > 0.0 {
-                        self.liq[i] += self.qty[cell];
+        for tranche in 0..self.tranches {
+            let mut decision = inp.at[(run, tranche, bar, phase)];
+            if decision >= 0 {
+                for idx in 0..self.active[tranche].len() {
+                    let asset = self.active[tranche][idx];
+                    let cell = self.at(tranche, asset);
+                    if inp.impound(phase, bar, asset) && self.qty[cell] > 0.0 {
+                        self.liq[asset] += self.qty[cell];
                         self.qty[cell] = 0.0;
-                        insert_sorted(&mut self.pool, i);
+                        insert_sorted(&mut self.pool, asset);
                     }
                 }
             }
-            if d >= 0 && inp.standing[(r, k, t, phase)] {
+            if decision >= 0 && inp.standing[(run, tranche, bar, phase)] {
                 let mut settled = true;
-                if d as i64 != self.attained_row[k] {
-                    for i in 0..self.n {
-                        let w = inp.plan[(r, k, d as usize, i)];
-                        let a = self.attained[self.at(k, i)];
-                        if w != a && (!w.is_nan() || !a.is_nan()) {
+                if decision as i64 != self.attained_row[tranche] {
+                    for asset in 0..self.assets {
+                        let weight = inp.plan[(run, tranche, decision as usize, asset)];
+                        let attained = self.attained[self.at(tranche, asset)];
+                        if weight != attained && (!weight.is_nan() || !attained.is_nan()) {
                             settled = false;
                             break;
                         }
                     }
                 }
                 if settled {
-                    d = -1;
+                    decision = -1;
                 }
             }
-            self.fire[k] = d as i64;
-            if d >= 0 {
+            self.fire[tranche] = decision as i64;
+            if decision >= 0 {
                 deciding = true;
             }
         }
@@ -244,22 +249,27 @@ impl Account {
 
     /// The liquidation pool tries to leave at every point.
     pub fn pool_sell(&mut self, inp: &Inputs, at: Point) {
-        let (t, phase, e) = (at.t, at.phase, at.e);
+        let (bar, phase, epoch) = (at.bar, at.phase, at.epoch);
         let mut emptied = false;
         for idx in 0..self.pool.len() {
-            let i = self.pool[idx];
-            if self.liq[i] <= 0.0 {
+            let asset = self.pool[idx];
+            if self.liq[asset] <= 0.0 {
                 continue;
             }
-            let p = inp.price(phase, t, i);
-            if p.is_nan() || p <= 0.0 || !inp.sellable(phase, t, i) {
+            let price = inp.price(phase, bar, asset);
+            if price.is_nan() || price <= 0.0 || !inp.sellable(phase, bar, asset) {
                 continue;
             }
-            let c = inp.class(i);
-            let give = self.liq[i];
-            let turnover = give * p * inp.rate(MULTIPLIER, e, c);
-            let fee = inp.fee(turnover, inp.rate(SELL_FEE, e, c), e, c);
-            self.liq[i] = 0.0;
+            let category = inp.class(asset);
+            let give = self.liq[asset];
+            let turnover = give * price * inp.rate(MULTIPLIER, epoch, category);
+            let fee = inp.fee(
+                turnover,
+                inp.rate(SELL_FEE, epoch, category),
+                epoch,
+                category,
+            );
+            self.liq[asset] = 0.0;
             self.cash += turnover - fee;
             self.fees += fee;
             self.sold += turnover;
@@ -267,7 +277,7 @@ impl Account {
         }
         if emptied {
             let liq = &self.liq;
-            self.pool.retain(|&i| liq[i] > 0.0);
+            self.pool.retain(|&asset| liq[asset] > 0.0);
         }
     }
 
@@ -275,16 +285,16 @@ impl Account {
     /// sold into it, so its proceeds are cash and its fees already paid.
     pub fn snapshot_equity(&mut self, inp: &Inputs, at: Point) {
         let mut equity = self.cash;
-        for &i in self.pool.iter() {
-            if self.liq[i] != 0.0 {
-                equity += self.worth(inp, at, i, self.liq[i]);
+        for &asset in self.pool.iter() {
+            if self.liq[asset] != 0.0 {
+                equity += self.worth(inp, at, asset, self.liq[asset]);
             }
         }
-        for k in 0..self.tranches {
-            for &i in self.active[k].iter() {
-                let units = self.qty[self.at(k, i)];
+        for tranche in 0..self.tranches {
+            for &asset in self.active[tranche].iter() {
+                let units = self.qty[self.at(tranche, asset)];
                 if units != 0.0 {
-                    equity += self.worth(inp, at, i, units);
+                    equity += self.worth(inp, at, asset, units);
                 }
             }
         }
@@ -292,12 +302,12 @@ impl Account {
     }
 
     /// The market value of one tranche's book.
-    pub fn holding(&self, inp: &Inputs, k: usize, at: Point) -> f64 {
+    pub fn holding(&self, inp: &Inputs, tranche: usize, at: Point) -> f64 {
         let mut holding = 0.0f64;
-        for &i in self.active[k].iter() {
-            let units = self.qty[self.at(k, i)];
+        for &asset in self.active[tranche].iter() {
+            let units = self.qty[self.at(tranche, asset)];
             if units != 0.0 {
-                holding += self.worth(inp, at, i, units);
+                holding += self.worth(inp, at, asset, units);
             }
         }
         holding
@@ -324,103 +334,118 @@ impl Account {
     /// The target this decision strikes for one name, or the book itself
     /// when the plan says nothing about it.
     #[inline]
-    pub fn strike(&self, inp: &Inputs, k: usize, i: usize, weight: f64, investable: f64, at: Point) -> f64 {
+    pub fn strike(
+        &self,
+        inp: &Inputs,
+        tranche: usize,
+        asset: usize,
+        weight: f64,
+        investable: f64,
+        at: Point,
+    ) -> f64 {
         if weight.is_nan() {
-            return self.qty[self.at(k, i)];
+            return self.qty[self.at(tranche, asset)];
         }
-        let (t, phase, e) = (at.t, at.phase, at.e);
-        let c = inp.class(i);
+        let (bar, phase, epoch) = (at.bar, at.phase, at.epoch);
+        let category = inp.class(asset);
         let mut want = decide(
             investable,
             weight,
-            inp.price(phase, t, i),
-            inp.rate(LOT, e, c),
-            inp.rate(MIN_LOT, e, c),
-            inp.rate(MIN_NOTIONAL, e, c),
-            inp.rate(MULTIPLIER, e, c),
+            inp.price(phase, bar, asset),
+            inp.rate(LOT, epoch, category),
+            inp.rate(MIN_LOT, epoch, category),
+            inp.rate(MIN_NOTIONAL, epoch, category),
+            inp.rate(MULTIPLIER, epoch, category),
         );
-        if want < 0.0 && !inp.flags[(SHORTABLE, c)] {
+        if want < 0.0 && !inp.flags[(SHORTABLE, category)] {
             want = 0.0;
         }
         want
     }
 
     /// Record what the tranche's book attained after trading decision `d`.
-    pub fn remember_attained(&mut self, inp: &Inputs, k: usize, d: usize) {
-        let r = self.r;
+    pub fn remember_attained(&mut self, inp: &Inputs, tranche: usize, decision: usize) {
+        let run = self.run;
         let mut whole = true;
-        for i in 0..self.n {
-            let cell = self.at(k, i);
+        for asset in 0..self.assets {
+            let cell = self.at(tranche, asset);
             if self.blocked[cell] {
                 whole = false;
             } else {
-                self.attained[cell] = inp.plan[(r, k, d, i)];
+                self.attained[cell] = inp.plan[(run, tranche, decision, asset)];
             }
         }
-        self.attained_row[k] = if whole { d as i64 } else { -1 };
+        self.attained_row[tranche] = if whole { decision as i64 } else { -1 };
     }
 
     /// The bar closes: what is held is worth the closing price, and the
     /// bar's series are reported.
-    pub fn close_bar(&mut self, inp: &Inputs, at: Point, reported: &mut [f64], positions: &mut [f64], steps: usize) {
-        let t = at.t;
-        for i in 0..self.n {
-            let m = inp.mark[(t, i)];
-            if !m.is_nan() && m > 0.0 {
-                self.last[i] = m;
+    pub fn close_bar(
+        &mut self,
+        inp: &Inputs,
+        at: Point,
+        reported: &mut [f64],
+        positions: &mut [f64],
+        steps: usize,
+    ) {
+        let bar = at.bar;
+        for asset in 0..self.assets {
+            let quote = inp.mark[(bar, asset)];
+            if !quote.is_nan() && quote > 0.0 {
+                self.last[asset] = quote;
             }
         }
         let mut value = 0.0f64;
         if inp.record_positions {
-            for i in 0..self.n {
-                let total = self.held(i);
+            for asset in 0..self.assets {
+                let total = self.held(asset);
                 if total != 0.0 {
-                    value += self.worth(inp, at, i, total);
+                    value += self.worth(inp, at, asset, total);
                 }
-                positions[t * self.n + i] = total;
+                positions[bar * self.assets + asset] = total;
             }
         } else {
-            for i in self.union_names() {
-                let total = self.held(i);
+            for asset in self.union_names() {
+                let total = self.held(asset);
                 if total != 0.0 {
-                    value += self.worth(inp, at, i, total);
+                    value += self.worth(inp, at, asset, total);
                 }
             }
         }
-        reported[EQUITY * steps + t] = self.cash + value;
-        reported[CASH * steps + t] = self.cash;
-        reported[FEES * steps + t] = self.fees;
-        reported[BOUGHT * steps + t] = self.bought;
-        reported[SOLD * steps + t] = self.sold;
+        reported[EQUITY * steps + bar] = self.cash + value;
+        reported[CASH * steps + bar] = self.cash;
+        reported[FEES * steps + bar] = self.fees;
+        reported[BOUGHT * steps + bar] = self.bought;
+        reported[SOLD * steps + bar] = self.sold;
     }
 }
 
 /// Insert `i` into an ascending list, if it is not there.
 #[inline]
-pub fn insert_sorted(names: &mut Vec<usize>, i: usize) {
-    if let Err(at) = names.binary_search(&i) {
-        names.insert(at, i);
+pub fn insert_sorted(names: &mut Vec<usize>, asset: usize) {
+    if let Err(at) = names.binary_search(&asset) {
+        names.insert(at, asset);
     }
 }
 
 /// The union of two ascending lists, ascending.
-pub fn merged(a: &[usize], b: &[usize]) -> Vec<usize> {
-    let mut out = Vec::with_capacity(a.len() + b.len());
-    let (mut x, mut y) = (0, 0);
-    while x < a.len() && y < b.len() {
-        if a[x] < b[y] {
-            out.push(a[x]);
-            x += 1;
-        } else if b[y] < a[x] {
-            out.push(b[y]);
-            y += 1;
+pub fn merged(left: &[usize], right: &[usize]) -> Vec<usize> {
+    let mut out = Vec::with_capacity(left.len() + right.len());
+    let (mut first, mut second) = (0, 0);
+    while first < left.len() && second < right.len() {
+        if left[first] < right[second] {
+            out.push(left[first]);
+            first += 1;
+        } else if right[second] < left[first] {
+            out.push(right[second]);
+            second += 1;
         } else {
-            out.push(a[x]);
-            x += 1;
-            y += 1;
+            out.push(left[first]);
+            first += 1;
+            second += 1;
         }
     }
-    out.extend_from_slice(&a[x..]);
-    out.extend_from_slice(&b[y..]);
+    out.extend_from_slice(&left[first..]);
+    out.extend_from_slice(&right[second..]);
     out
 }

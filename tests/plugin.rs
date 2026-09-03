@@ -7,17 +7,26 @@ use johnnybt_engine::plugin::{simulate, Firing, SimulateKwargs};
 use polars::prelude::*;
 
 fn lists_f64(name: &str, rows: &[Vec<f64>]) -> Series {
-    let inner: Vec<Series> = rows.iter().map(|r| Series::new("".into(), r.as_slice())).collect();
+    let inner: Vec<Series> = rows
+        .iter()
+        .map(|row| Series::new("".into(), row.as_slice()))
+        .collect();
     Series::new(name.into(), inner)
 }
 
 fn lists_bool(name: &str, rows: &[Vec<bool>]) -> Series {
-    let inner: Vec<Series> = rows.iter().map(|r| Series::new("".into(), r.as_slice())).collect();
+    let inner: Vec<Series> = rows
+        .iter()
+        .map(|row| Series::new("".into(), row.as_slice()))
+        .collect();
     Series::new(name.into(), inner)
 }
 
 fn lists_i32(name: &str, rows: &[Vec<i32>]) -> Series {
-    let inner: Vec<Series> = rows.iter().map(|r| Series::new("".into(), r.as_slice())).collect();
+    let inner: Vec<Series> = rows
+        .iter()
+        .map(|row| Series::new("".into(), row.as_slice()))
+        .collect();
     Series::new(name.into(), inner)
 }
 
@@ -50,7 +59,12 @@ fn an_account_holding_nothing_keeps_its_capital() {
         buyable: Some(vec![2]),
         sellable: Some(vec![3]),
         impound: Some(vec![4]),
-        firings: vec![Firing { tranche: 0, point: 0, plan: 8, standing: None }],
+        firings: vec![Firing {
+            tranche: 0,
+            point: 0,
+            plan: 8,
+            standing: None,
+        }],
         instrument: 5,
         epoch: 6,
         new_day: 7,
