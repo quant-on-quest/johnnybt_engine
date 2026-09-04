@@ -3,7 +3,7 @@
 use ndarray::{Array2, Array3, Axis};
 use rayon::prelude::*;
 
-use crate::account::Account;
+use crate::account::{Account, Fill};
 use crate::bookkeeping::Bookkeeping;
 use crate::inputs::*;
 
@@ -13,13 +13,14 @@ pub fn run_account<B: Bookkeeping>(
     inp: &Inputs,
     reported: &mut [f64],
     positions: &mut [f64],
-) {
+) -> Vec<Fill> {
     let tranches = inp.plan.shape()[1];
     let assets = inp.plan.shape()[3];
     let phases = inp.points();
     let steps = inp.steps();
 
     let mut acct = Account::new(run, tranches, assets, inp.capital);
+    acct.record_fills = inp.record_fills;
     let mut book = B::new(tranches, assets);
     let mut scaled: Vec<(usize, f64)> = Vec::new();
 
@@ -64,33 +65,35 @@ pub fn run_account<B: Bookkeeping>(
         );
         acct.sweep(|tranche, asset| book.at_rest(tranche, asset));
     }
+    acct.fills
 }
 
 /// Run every account in parallel, one policy for all.
 ///
-/// Returns `(5, R, T)` reported series and `(R, T, N)` positions (or a
-/// `(1, 1, 1)` placeholder when positions are not recorded).
-pub fn run_all<B: Bookkeeping>(inputs: &Inputs) -> (Array3<f64>, Array3<f64>) {
+/// Returns `(5, R, T)` reported series, `(R, T, N)` positions (or a
+/// `(1, 1, 1)` placeholder when positions are not recorded) and each run's
+/// fills in walk order (empty unless recorded).
+pub fn run_all<B: Bookkeeping>(inputs: &Inputs) -> (Array3<f64>, Array3<f64>, Vec<Vec<Fill>>) {
     let runs = inputs.plan.shape()[0];
     let steps = inputs.steps();
     let assets = inputs.plan.shape()[3];
     let record_positions = inputs.record_positions;
-
     let mut reported = Array3::<f64>::zeros((runs, REPORTED, steps));
     let mut positions = if record_positions {
         Array3::<f64>::zeros((runs, steps, assets))
     } else {
         Array3::<f64>::zeros((1, 1, 1))
     };
-
+    let mut fills: Vec<Vec<Fill>> = (0..runs).map(|_| Vec::new()).collect();
     let report_iter = reported.axis_iter_mut(Axis(0)).into_iter();
     if record_positions {
         report_iter
             .zip(positions.axis_iter_mut(Axis(0)))
+            .zip(fills.iter_mut())
             .enumerate()
             .par_bridge()
-            .for_each(|(run, (mut rep, mut pos))| {
-                run_account::<B>(
+            .for_each(|(run, ((mut rep, mut pos), sink))| {
+                *sink = run_account::<B>(
                     run,
                     inputs,
                     rep.as_slice_mut().expect("contiguous"),
@@ -101,10 +104,11 @@ pub fn run_all<B: Bookkeeping>(inputs: &Inputs) -> (Array3<f64>, Array3<f64>) {
         let mut dummies: Vec<Array2<f64>> = (0..runs).map(|_| Array2::zeros((1, 1))).collect();
         report_iter
             .zip(dummies.iter_mut())
+            .zip(fills.iter_mut())
             .enumerate()
             .par_bridge()
-            .for_each(|(run, (mut rep, dummy))| {
-                run_account::<B>(
+            .for_each(|(run, ((mut rep, dummy), sink))| {
+                *sink = run_account::<B>(
                     run,
                     inputs,
                     rep.as_slice_mut().expect("contiguous"),
@@ -112,8 +116,6 @@ pub fn run_all<B: Bookkeeping>(inputs: &Inputs) -> (Array3<f64>, Array3<f64>) {
                 );
             });
     }
-
-    // Reported comes back as (5, runs, steps) for the caller's indexing.
     let mut packed = Array3::<f64>::zeros((REPORTED, runs, steps));
     for run in 0..runs {
         for series in 0..REPORTED {
@@ -122,5 +124,5 @@ pub fn run_all<B: Bookkeeping>(inputs: &Inputs) -> (Array3<f64>, Array3<f64>) {
             }
         }
     }
-    (packed, positions)
+    (packed, positions, fills)
 }

@@ -8,6 +8,25 @@
 
 use crate::inputs::*;
 
+/// The tranche a fill wears when the liquidation pool made it.
+pub const POOL: i32 = -1;
+
+/// One fill, as it happened.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fill {
+    pub bar: u32,
+    pub point: u32,
+    /// The tranche whose book filled; `POOL` for the liquidation pool.
+    pub tranche: i32,
+    pub asset: u32,
+    /// Units, positive bought and negative sold.
+    pub units: f64,
+    /// The price per unit it filled at.
+    pub price: f64,
+    /// What the fill cost in fees.
+    pub fee: f64,
+}
+
 /// One account's state, for one run.
 pub struct Account {
     /// Which run this account is.
@@ -51,6 +70,11 @@ pub struct Account {
     pub sold: f64,
     /// The equity read at the point sizing happens.
     pub equity: f64,
+    /// Whether fills go on record. Off, `fill` is one branch and nothing
+    /// else — the walk's cost does not move.
+    pub record_fills: bool,
+    /// Every fill so far, in walk order, when recorded.
+    pub fills: Vec<Fill>,
 }
 
 impl Account {
@@ -74,6 +98,24 @@ impl Account {
             bought: 0.0,
             sold: 0.0,
             equity: 0.0,
+            record_fills: false,
+            fills: Vec::new(),
+        }
+    }
+
+    /// Put one fill on record, when fills are being recorded.
+    #[inline]
+    pub fn fill(&mut self, at: Point, tranche: i32, asset: usize, units: f64, price: f64, fee: f64) {
+        if self.record_fills {
+            self.fills.push(Fill {
+                bar: at.bar as u32,
+                point: at.phase as u32,
+                tranche,
+                asset: asset as u32,
+                units,
+                price,
+                fee,
+            });
         }
     }
 
@@ -273,6 +315,7 @@ impl Account {
             self.cash += turnover - fee;
             self.fees += fee;
             self.sold += turnover;
+            self.fill(at, POOL, asset, -give, price, fee);
             emptied = true;
         }
         if emptied {

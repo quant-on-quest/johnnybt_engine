@@ -163,6 +163,7 @@ impl Plain {
             acct.cash += turnover - fee;
             acct.fees += fee;
             acct.sold += turnover;
+            acct.fill(at, tranche as i32, asset, -give, price, fee);
         }
     }
 
@@ -235,6 +236,7 @@ impl Plain {
         acct.cash -= turnover + fee;
         acct.fees += fee;
         acct.bought += turnover;
+        acct.fill(at, tranche as i32, asset, take, inp.price(at.phase, at.bar, asset), fee);
     }
 }
 

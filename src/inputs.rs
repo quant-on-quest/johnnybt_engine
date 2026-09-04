@@ -54,6 +54,8 @@ pub struct Inputs<'a> {
     pub buffer: f64,
     pub audit: bool,
     pub record_positions: bool,
+    /// Whether every fill goes on the account's record.
+    pub record_fills: bool,
 }
 
 impl<'a> Inputs<'a> {

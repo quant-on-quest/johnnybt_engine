@@ -55,10 +55,24 @@ pub struct SimulateKwargs {
     /// Whether to report the `(N,)` quantities held on each bar as well.
     #[serde(default)]
     pub positions: bool,
+    /// Whether every fill is answered, as per-bar lists.
+    #[serde(default)]
+    pub fills: bool,
 }
 
 /// The output field of the expression: one struct per bar.
-pub fn output_field(name: &str, positions: bool) -> Field {
+/// The fill columns, one list per bar, the lists of a bar in step:
+/// tranche, asset and point as `Int32`, units, price and fee as `Float64`.
+pub const FILL_COLUMNS: [&str; 6] = [
+    "fill_tranche",
+    "fill_asset",
+    "fill_point",
+    "fill_units",
+    "fill_price",
+    "fill_fee",
+];
+
+pub fn output_field(name: &str, positions: bool, fills: bool) -> Field {
     let mut fields: Vec<Field> = ["equity", "cash", "fees", "bought", "sold"]
         .into_iter()
         .map(|firing| Field::new(firing.into(), DataType::Float64))
@@ -69,7 +83,80 @@ pub fn output_field(name: &str, positions: bool) -> Field {
             DataType::List(Box::new(DataType::Float64)),
         ));
     }
+    if fills {
+        for (index, column) in FILL_COLUMNS.iter().enumerate() {
+            let inner = if index < 3 {
+                DataType::Int32
+            } else {
+                DataType::Float64
+            };
+            fields.push(Field::new((*column).into(), DataType::List(Box::new(inner))));
+        }
+    }
     Field::new(name.into(), DataType::Struct(fields))
+}
+
+/// Lay one run's fills out as the six per-bar list columns.
+fn fill_columns(fills: &[crate::account::Fill], steps: usize) -> Vec<Series> {
+    let mut tranche = ListPrimitiveChunkedBuilder::<Int32Type>::new(
+        FILL_COLUMNS[0].into(),
+        steps,
+        fills.len(),
+        DataType::Int32,
+    );
+    let mut asset = ListPrimitiveChunkedBuilder::<Int32Type>::new(
+        FILL_COLUMNS[1].into(),
+        steps,
+        fills.len(),
+        DataType::Int32,
+    );
+    let mut point = ListPrimitiveChunkedBuilder::<Int32Type>::new(
+        FILL_COLUMNS[2].into(),
+        steps,
+        fills.len(),
+        DataType::Int32,
+    );
+    let mut units = ListPrimitiveChunkedBuilder::<Float64Type>::new(
+        FILL_COLUMNS[3].into(),
+        steps,
+        fills.len(),
+        DataType::Float64,
+    );
+    let mut price = ListPrimitiveChunkedBuilder::<Float64Type>::new(
+        FILL_COLUMNS[4].into(),
+        steps,
+        fills.len(),
+        DataType::Float64,
+    );
+    let mut fee = ListPrimitiveChunkedBuilder::<Float64Type>::new(
+        FILL_COLUMNS[5].into(),
+        steps,
+        fills.len(),
+        DataType::Float64,
+    );
+    // Fills come in walk order, so each bar's are one contiguous stretch.
+    let mut cursor = 0usize;
+    for bar in 0..steps {
+        let start = cursor;
+        while cursor < fills.len() && fills[cursor].bar as usize == bar {
+            cursor += 1;
+        }
+        let slice = &fills[start..cursor];
+        tranche.append_slice(&slice.iter().map(|fill| fill.tranche).collect::<Vec<i32>>());
+        asset.append_slice(&slice.iter().map(|fill| fill.asset as i32).collect::<Vec<i32>>());
+        point.append_slice(&slice.iter().map(|fill| fill.point as i32).collect::<Vec<i32>>());
+        units.append_slice(&slice.iter().map(|fill| fill.units).collect::<Vec<f64>>());
+        price.append_slice(&slice.iter().map(|fill| fill.price).collect::<Vec<f64>>());
+        fee.append_slice(&slice.iter().map(|fill| fill.fee).collect::<Vec<f64>>());
+    }
+    vec![
+        tranche.finish().into_series(),
+        asset.finish().into_series(),
+        point.finish().into_series(),
+        units.finish().into_series(),
+        price.finish().into_series(),
+        fee.finish().into_series(),
+    ]
 }
 
 fn width_of(column: &Series) -> PolarsResult<usize> {
@@ -353,8 +440,9 @@ pub fn simulate<B: Bookkeeping>(
         buffer: kwargs.buffer,
         audit: kwargs.audit,
         record_positions: kwargs.positions,
+        record_fills: kwargs.fills,
     };
-    let (reported, held) = run_all::<B>(&run);
+    let (reported, held, fills) = run_all::<B>(&run);
     let series = |row: usize, name: &str| -> Series {
         let values: Vec<f64> = (0..steps).map(|bar| reported[(row, 0, bar)]).collect();
         Series::new(name.into(), values)
@@ -373,6 +461,9 @@ pub fn simulate<B: Bookkeeping>(
             ReshapeDimension::Specified(Dimension::new(width as u64)),
         ])?;
         fields.push(quantities);
+    }
+    if kwargs.fills {
+        fields.extend(fill_columns(&fills[0], steps));
     }
     let out = StructChunked::from_series("simulate".into(), steps, fields.iter())?;
     Ok(out.into_series())
