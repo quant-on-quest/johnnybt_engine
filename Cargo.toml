@@ -2,6 +2,12 @@
 name = "johnnybt_engine"
 version = "0.1.0"
 edition = "2021"
+description = "An account walk as a Rust library: the path-dependent half of a backtest, market-neutral."
+license = "MIT"
+repository = "https://github.com/quant-on-quest/johnnybt_engine"
+readme = "README.md"
+keywords = ["backtest", "quant", "portfolio", "simulation"]
+categories = ["finance", "simulation"]
 
 # The account walk as a library: no Python in it. A policy crate links it
 # for the bookkeeping trait; a polars plugin crate links it with the
